@@ -4,7 +4,14 @@
 # détectés. Ne pas éditer à la main le bloc entre marqueurs.
 name: GitHub Classroom Workflow
 
-on: [push]
+# Le calcul de note ne tourne que sur main : un exercice n'est livré qu'au
+# moment du merge. Les pushes sur les feature branches (exerciceN) restent
+# couverts par maven.yml (compilation + tests), qui suffit pour le feedback
+# pédagogique. workflow_dispatch reste dispo pour un regrade manuel.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -17,6 +24,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          # Historique complet pour que `git diff $BEFORE..HEAD` fonctionne
+          # dans le step de scope (sans ça, on tomberait sur ALL à chaque push).
+          fetch-depth: 0
 
       - name: Set up JDK 25 with JavaFX
         uses: actions/setup-java@v5
@@ -37,6 +48,90 @@ jobs:
           timeout: 5
           max-score: 100
 
+      - name: Restaurer le cache des rapports Surefire
+        id: surefire_cache
+        uses: actions/cache/restore@v5
+        with:
+          path: target/surefire-reports
+          key: surefire-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            surefire-${{ github.ref_name }}-
+            surefire-main-
+
+      - name: Détecter les exercices impactés
+        id: scope
+        run: |
+          set +e
+          BEFORE="${{ github.event.before }}"
+          # Cache vide (premier run, expiration GHA) -> regrade complet sinon les
+          # XMLs absents donneraient un score 0 à tout le monde.
+          if [ ! -d target/surefire-reports ] || [ -z "$(ls -A target/surefire-reports 2>/dev/null)" ]; then
+            echo "filter=ALL" >> "$GITHUB_OUTPUT"
+            echo "reason=cache des rapports absent ou expiré" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Premier push sur la branche, ou commit base introuvable -> tout regrader
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            echo "filter=ALL" >> "$GITHUB_OUTPUT"
+            echo "reason=premier push sur la branche ou commit base introuvable" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Fichiers globaux : invalident le cache (regrade complet)
+          if git diff --name-only "$BEFORE" HEAD -- \
+              pom.xml \
+              '.github/workflows/**' \
+              '*.sh' \
+              'src/main/java/fr/univ_amu/iut/App.java' \
+              'src/main/java/fr/univ_amu/iut/module-info.java' \
+              'src/test/java/fr/univ_amu/iut/AppTest.java' \
+              | grep -q .; then
+            echo "filter=ALL" >> "$GITHUB_OUTPUT"
+            echo "reason=fichier global modifié (pom.xml / App / workflows / scripts)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Détection fine : paquets exerciceN / bonusN modifiés
+          pkgs=$(git diff --name-only "$BEFORE" HEAD -- \
+              'src/main/java/fr/univ_amu/iut/exercice*/**' \
+              'src/test/java/fr/univ_amu/iut/exercice*/**' \
+              'src/main/java/fr/univ_amu/iut/bonus*/**' \
+              'src/test/java/fr/univ_amu/iut/bonus*/**' \
+              | grep -oE 'fr/univ_amu/iut/(exercice[0-9]+|bonus[0-9]+)' \
+              | sort -u | tr '/' '.')
+          if [ -z "$pkgs" ]; then
+            echo "filter=NONE" >> "$GITHUB_OUTPUT"
+            echo "reason=aucune source d'exercice modifiée (mvnw test sauté, scores restaurés du cache)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Énumère les classes de test des paquets impactés (FQCN explicites)
+          classes=""
+          for pkg in $pkgs; do
+            pkg_dir="src/test/java/$(echo "$pkg" | tr '.' '/')"
+            while IFS= read -r f; do
+              cls=$(basename "$f" .java)
+              classes="${classes}${classes:+,}${pkg}.${cls}"
+            done < <(find "$pkg_dir" -type f -name '*.java' 2>/dev/null)
+          done
+          if [ -z "$classes" ]; then
+            echo "filter=NONE" >> "$GITHUB_OUTPUT"
+            echo "reason=paquets modifiés mais aucune classe de test trouvée" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "filter=$classes" >> "$GITHUB_OUTPUT"
+          echo "reason=paquets impactés : $(echo $pkgs | tr '\\n' ' ')" >> "$GITHUB_OUTPUT"
+
+      - name: Lancer les tests impactés
+        id: run_tests
+        if: steps.scope.outputs.filter != 'NONE'
+        continue-on-error: true
+        run: |
+          echo "Scope : ${{ steps.scope.outputs.reason }}"
+          if [ "${{ steps.scope.outputs.filter }}" = "ALL" ]; then
+            xvfb-run --auto-servernum ./mvnw -B test -DfailIfNoTests=false
+          else
+            xvfb-run --auto-servernum ./mvnw -B test -Dtest='${{ steps.scope.outputs.filter }}' -DfailIfNoTests=false
+          fi
+
+
       - name: "exercice1 : laFenetreEstVisible"
         id: exercice1_laFenetreEstVisible
         uses: IUTInfoAix-R202/autograding-command-grader@main
@@ -54,6 +149,16 @@ jobs:
           test-name: "exercice2 : laFenetreEstVisible"
           setup-command: ""
           command: ./grade-test.sh fr.univ_amu.iut.exercice2.StagePersonnaliseTest laFenetreEstVisible
+          timeout: 5
+          max-score: 30
+
+      - name: "exercice2 : leStyleEstUndecorated"
+        id: exercice2_leStyleEstUndecorated
+        uses: IUTInfoAix-R202/autograding-command-grader@main
+        with:
+          test-name: "exercice2 : leStyleEstUndecorated"
+          setup-command: ""
+          command: ./grade-test.sh fr.univ_amu.iut.exercice2.StagePersonnaliseTest leStyleEstUndecorated
           timeout: 5
           max-score: 30
 
@@ -84,16 +189,6 @@ jobs:
           test-name: "exercice2 : laFenetreNestPasRedimensionnable"
           setup-command: ""
           command: ./grade-test.sh fr.univ_amu.iut.exercice2.StagePersonnaliseTest laFenetreNestPasRedimensionnable
-          timeout: 5
-          max-score: 30
-
-      - name: "exercice2 : leStyleEstUndecorated"
-        id: exercice2_leStyleEstUndecorated
-        uses: IUTInfoAix-R202/autograding-command-grader@main
-        with:
-          test-name: "exercice2 : leStyleEstUndecorated"
-          setup-command: ""
-          command: ./grade-test.sh fr.univ_amu.iut.exercice2.StagePersonnaliseTest leStyleEstUndecorated
           timeout: 5
           max-score: 30
 
@@ -504,10 +599,10 @@ jobs:
           COMPILATION_RESULTS: "${{ steps.compilation.outputs.result }}"
           EXERCICE1_LAFENETREESTVISIBLE_RESULTS: "${{ steps.exercice1_laFenetreEstVisible.outputs.result }}"
           EXERCICE2_LAFENETREESTVISIBLE_RESULTS: "${{ steps.exercice2_laFenetreEstVisible.outputs.result }}"
+          EXERCICE2_LESTYLEESTUNDECORATED_RESULTS: "${{ steps.exercice2_leStyleEstUndecorated.outputs.result }}"
           EXERCICE2_LETITREESTDEFINI_RESULTS: "${{ steps.exercice2_leTitreEstDefini.outputs.result }}"
           EXERCICE2_LESDIMENSIONSSONTDEFINIES_RESULTS: "${{ steps.exercice2_lesDimensionsSontDefinies.outputs.result }}"
           EXERCICE2_LAFENETRENESTPASREDIMENSIONNABLE_RESULTS: "${{ steps.exercice2_laFenetreNestPasRedimensionnable.outputs.result }}"
-          EXERCICE2_LESTYLEESTUNDECORATED_RESULTS: "${{ steps.exercice2_leStyleEstUndecorated.outputs.result }}"
           EXERCICE3_LAFENETREESTVISIBLE_RESULTS: "${{ steps.exercice3_laFenetreEstVisible.outputs.result }}"
           EXERCICE3_LASCENEEXISTE_RESULTS: "${{ steps.exercice3_laSceneExiste.outputs.result }}"
           EXERCICE3_LEROOTESTUNBORDERPANE_RESULTS: "${{ steps.exercice3_leRootEstUnBorderPane.outputs.result }}"
@@ -549,5 +644,12 @@ jobs:
           EXERCICE6_CLIQUERINCREMENTELECOMPTEURCORRESPONDANT_RESULTS: "${{ steps.exercice6_cliquerIncrementeLeCompteurCorrespondant.outputs.result }}"
           EXERCICE6_LESCOMPTEURSSONTINDEPENDANTS_RESULTS: "${{ steps.exercice6_lesCompteursSontIndependants.outputs.result }}"
         with:
-          runners: compilation,exercice1_laFenetreEstVisible,exercice2_laFenetreEstVisible,exercice2_leTitreEstDefini,exercice2_lesDimensionsSontDefinies,exercice2_laFenetreNestPasRedimensionnable,exercice2_leStyleEstUndecorated,exercice3_laFenetreEstVisible,exercice3_laSceneExiste,exercice3_leRootEstUnBorderPane,exercice3_unLabelEstPresent,exercice3_leLabelAfficheLeBonTexte,exercice3_leLabelEstAuCentreDuBorderPane,exercice4_laFenetreEstVisible,exercice4_leRootEstUnBorderPane,exercice4_leMenuBarEstEnHaut,exercice4_leMenuBarContientDeuxMenus,exercice4_lesMenusOntLesBonsNoms,exercice4_leGridPaneEstAuCentre,exercice4_lesLabelsNomEtEmailExistent,exercice4_lesDeuxChampsDeSaisieExistent,exercice4_leHBoxEstEnBas,exercice4_leBoutonValiderExiste,exercice4_leBoutonAnnulerExiste,exercice5_handleIncrementeLeCompteur,exercice5_laFenetreEstVisible,exercice5_laSceneExiste,exercice5_laRacineEstUnVBox,exercice5_leBoutonExiste,exercice5_leBoutonAfficheLeBonTexte,exercice5_leLabelCompteurExiste,exercice5_leLabelAfficheZeroClicsInitialement,exercice5_troisClicsAffichent3Clics,exercice6_laFenetreEstVisible,exercice6_laSceneExiste,exercice6_laRacineEstUnBorderPane,exercice6_lesTroisBoutonsExistent,exercice6_leHBoxDesBoutonsEstEnHaut,exercice6_laZoneDeCouleurExiste,exercice6_leLabelCompteursExiste,exercice6_leLabelCompteursEstEnBas,exercice6_leTexteInitialDesCompteurs,exercice6_cliquerRougeMetLaZoneEnRouge,exercice6_cliquerVertMetLaZoneEnVert,exercice6_cliquerBleuMetLaZoneEnBleu,exercice6_cliquerIncrementeLeCompteurCorrespondant,exercice6_lesCompteursSontIndependants
+          runners: compilation,exercice1_laFenetreEstVisible,exercice2_laFenetreEstVisible,exercice2_leStyleEstUndecorated,exercice2_leTitreEstDefini,exercice2_lesDimensionsSontDefinies,exercice2_laFenetreNestPasRedimensionnable,exercice3_laFenetreEstVisible,exercice3_laSceneExiste,exercice3_leRootEstUnBorderPane,exercice3_unLabelEstPresent,exercice3_leLabelAfficheLeBonTexte,exercice3_leLabelEstAuCentreDuBorderPane,exercice4_laFenetreEstVisible,exercice4_leRootEstUnBorderPane,exercice4_leMenuBarEstEnHaut,exercice4_leMenuBarContientDeuxMenus,exercice4_lesMenusOntLesBonsNoms,exercice4_leGridPaneEstAuCentre,exercice4_lesLabelsNomEtEmailExistent,exercice4_lesDeuxChampsDeSaisieExistent,exercice4_leHBoxEstEnBas,exercice4_leBoutonValiderExiste,exercice4_leBoutonAnnulerExiste,exercice5_handleIncrementeLeCompteur,exercice5_laFenetreEstVisible,exercice5_laSceneExiste,exercice5_laRacineEstUnVBox,exercice5_leBoutonExiste,exercice5_leBoutonAfficheLeBonTexte,exercice5_leLabelCompteurExiste,exercice5_leLabelAfficheZeroClicsInitialement,exercice5_troisClicsAffichent3Clics,exercice6_laFenetreEstVisible,exercice6_laSceneExiste,exercice6_laRacineEstUnBorderPane,exercice6_lesTroisBoutonsExistent,exercice6_leHBoxDesBoutonsEstEnHaut,exercice6_laZoneDeCouleurExiste,exercice6_leLabelCompteursExiste,exercice6_leLabelCompteursEstEnBas,exercice6_leTexteInitialDesCompteurs,exercice6_cliquerRougeMetLaZoneEnRouge,exercice6_cliquerVertMetLaZoneEnVert,exercice6_cliquerBleuMetLaZoneEnBleu,exercice6_cliquerIncrementeLeCompteurCorrespondant,exercice6_lesCompteursSontIndependants
+
+      - name: Sauvegarder le cache des rapports Surefire
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: target/surefire-reports
+          key: surefire-${{ github.ref_name }}-${{ github.sha }}
       #@@@AUTOGRADING-END@@@
