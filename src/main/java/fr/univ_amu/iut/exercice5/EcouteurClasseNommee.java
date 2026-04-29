@@ -23,5 +23,6 @@ public class EcouteurClasseNommee implements EventHandler<ActionEvent> {
     // TODO exercice 5 : incrémenter le compteur à chaque appel.
     //
     // Une seule ligne suffit. Utilise la méthode incrementer() de Compteur.
+    compteur.incrementer();
   }
 }
